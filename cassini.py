@@ -4,25 +4,34 @@
 """
 Cassini 2002 solar conjunction geometry
 
-Downloads heliocentric vectors from JPL Horizons and computes:
+Downloads barycentric vectors from JPL Horizons and computes:
 
-    Date
-    Sun-Earth distance
-    Sun-Cassini distance
-    Earth-Cassini distance
-    Impact parameter
-
-Results are written to geometry.csv
+    - t1: Emission time
+    - t2: Closest approach  (up-link)
+    - t3: Cassini reception time
+    - t4: Closest approach (down-link)
+    - t5: Reception time
+    - Shapiro time delay (Logarithmic expression)
+    - Shapiro time delay (Expanded expression)
+    - Derivative of each version 
+    - Impact parameter evolution
+    - Impact parameter rate evolution
+    - Second derivative (Impact on residuals)
 """
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from astroquery.jplhorizons import Horizons
 from astropy.time import Time
-from datetime import datetime
 
+from datetime import datetime, timedelta
+
+from scipy.interpolate import interp1d
+from scipy.optimize import minimize_scalar
+
+
+import os
 
 # Physical constants (SI)
 
@@ -33,29 +42,27 @@ GM_SUN = 1.32712440018e20      # m^3/s^2
 C = 299792458.0                # m/s
 AU = 149597870700.0            # m
 
-K = 2.0 * GM_SUN / C**3        # seconds
-
+m = 2.0 * GM_SUN / C**3        # seconds
 
 # ---------------------------------------------------------
 
 def get_vectors(target):
 
     epochs = {
-        "start": "2002-06-06",
-        "stop": "2002-07-07",
-        "step": "1m",
+        "start": "2002-06-05",
+        "stop": "2002-07-08",
+        "step": "10m",
     }
 
     obj = Horizons(
         id=target,
-        location="@10",      # Sun
+        location="@0", #barycentric
         epochs=epochs,
     )
 
     vec = obj.vectors()
 
     return vec
-
 
 # ---------------------------------------------------------
 
@@ -67,35 +74,64 @@ print("Downloading Cassini vectors...")
 
 cassini = get_vectors("-82")
 
+print("Downloading Sun vectors...")
+sun = get_vectors("10")
+
 rows = []
 
-for e, c in zip(earth, cassini):
+for e, c, s in zip(earth, cassini, sun):
 
     date = e["datetime_str"]
 
-    rE = np.array([e["x"], e["y"], e["z"]], dtype=float)
-    rC = np.array([c["x"], c["y"], c["z"]], dtype=float)
+    rE = np.array([
+        e["x"], e["y"], e["z"]
+    ], dtype=float)
 
+    rC = np.array([
+        c["x"], c["y"], c["z"]
+    ], dtype=float)
+
+    rS = np.array([
+        s["x"], s["y"], s["z"]
+    ], dtype=float)
+
+    # Earth -> Cassini
     rEC_vec = rC - rE
 
-    rE_AU = np.linalg.norm(rE)
-    rC_AU = np.linalg.norm(rC)
-    rEC_AU = np.linalg.norm(rEC_vec)
+    # Heliocentric vectors
+    rE_Sun = rE - rS
+    rC_Sun = rC - rS
 
-    b_AU = np.linalg.norm(np.cross(rE, rC)) / rEC_AU
+    # Distances
+    rEC_AU = np.linalg.norm(rEC_vec)
+    rE_Sun_AU = np.linalg.norm(rE_Sun)
+    rC_Sun_AU = np.linalg.norm(rC_Sun)
 
     rows.append({
         "date": date,
-        "Sun-Earth (AU)": rE_AU,
-        "Sun-Cassini (AU)": rC_AU,
+
+        # Barycentric coordinates
+        "xE": rE[0],
+        "yE": rE[1],
+        "zE": rE[2],
+
+        "xC": rC[0],
+        "yC": rC[1],
+        "zC": rC[2],
+
+        "xS": rS[0],
+        "yS": rS[1],
+        "zS": rS[2],
+
+        # Distances
         "Earth-Cassini (AU)": rEC_AU,
-        "Impact parameter (AU)": b_AU,
-        "Impact parameter (Rsun)": b_AU * AU_KM / RSUN_KM,
+        "Earth-Sun (AU)": rE_Sun_AU,
+        "Cassini-Sun (AU)": rC_Sun_AU,
     })
 
 df = pd.DataFrame(rows)
 
-####
+# Time grid in seconds, relative to first epoch
 t = np.array([
     datetime.strptime(
         s,
@@ -104,253 +140,338 @@ t = np.array([
     for s in df["date"]
 ])
 
-# Distancias en metros
-rE = df["Sun-Earth (AU)"].to_numpy() * AU
-rC = df["Sun-Cassini (AU)"].to_numpy() * AU
-R  = df["Earth-Cassini (AU)"].to_numpy() * AU
+t = t - t[0]
 
-b  = df["Impact parameter (AU)"] * AU
+rE_vec = df[["xE", "yE", "zE"]].to_numpy()
+rC_vec = df[["xC", "yC", "zC"]].to_numpy()
+rS_vec = df[["xS", "yS", "zS"]].to_numpy()
 
-# Distancia desde la Tierra al punto de máxima aproximación
-df["LE (AU)"] = np.sqrt(rE**2 - b**2)
-
-# Distancia desde Cassini al punto de máxima aproximación
-df["LC (AU)"] = np.sqrt(rC**2 - b**2)
-
-# Cocientes adimensionales
-df["LE/rE"] = df["LE (AU)"] / rE
-df["LC/rC"] = df["LC (AU)"] / rC
-
-# Suma
-df["LE/rE + LC/rC"] = df["LE/rE"] + df["LC/rC"] - 2
-
-lE = df["LE/rE"].to_numpy() 
-lC = df["LC/rC"].to_numpy() 
-
-lsum = GM_SUN / C**3 * ( lE + lC )
-
-# Shapiro
-df["Shapiro (s)"] = (
-    2 * GM_SUN / C**3
-    * np.log((rE + rC + R) / (rE + rC - R))
-)
-df["Shapiro (us)"] = 1e6 * df["Shapiro (s)"]
-
-delay = df["Shapiro (s)"].to_numpy()
-
-# Shapiro JG
-df["Shapiro JG (s)"] = (
-    2 * GM_SUN / C**3
-    * np.log((rE + rC + R) / (rE + rC - R)) + GM_SUN / C**3 * (lE + lC)
-)
-df["Shapiro JG (us)"] = 1e6 * df["Shapiro JG (s)"]
-
-delayJG = df["Shapiro JG (s)"].to_numpy()
-
-y = np.gradient(delay, t)
-yJG = np.gradient(delayJG, t)
-
-df["y"] = y
-df["y x1e13"] = 1e13 * y
-df["yJG"] = yJG
-df["yJG x1e13"] = 1e13 * yJG
-
-imax = np.argmax(np.abs(y))
-
-print(df.loc[imax, [
-    "date",
-    "Impact parameter (Rsun)"
-]])
-
-print("Maximum |y| =", np.abs(y[imax]))
-
-imax = df["Shapiro (us)"].idxmax()
-
-print("\nMaximum Shapiro delay")
-print(df.loc[imax, [
-    "date",
-    "Impact parameter (Rsun)",
-    "Shapiro (us)"
-]])
-
-rE_AU = df["Sun-Earth (AU)"]
-rC_AU = df["Sun-Cassini (AU)"]
-R_AU  = df["Earth-Cassini (AU)"]
-b_AU  = df["Impact parameter (AU)"]
-
-df["LE (AU)"] = np.sqrt(rE_AU**2 - b_AU**2)
-df["LC (AU)"] = np.sqrt(rC_AU**2 - b_AU**2)
-
-df["LE/rE"] = df["LE (AU)"]/rE_AU
-df["LC/rC"] = df["LC (AU)"]/rC_AU
-
-df["Shapiro approx (s)"] = (
-    2 * GM_SUN / C**3
-    * np.log(4 * rE_AU * rC_AU / b_AU**2)
+interp_E = interp1d(
+    t,
+    rE_vec,
+    axis=0,
+    kind="cubic",
+    bounds_error=True
 )
 
-df["Difference (ns)"] = (
-    1e9
-    * (df["Shapiro (s)"] - df["Shapiro approx (s)"])
+interp_C = interp1d(
+    t,
+    rC_vec,
+    axis=0,
+    kind="cubic",
+    bounds_error=True
 )
 
-print(df[[
-    "date",
-    "Shapiro (us)",
-    "Difference (ns)"
-]].round(6))
-
-print(
-    df[
-        [
-            "date",
-            "LE (AU)",
-            "LC (AU)",
-            "LE/rE",
-            "LC/rC",
-            "LE/rE + LC/rC",
-        ]
-    ].round(8)
+interp_S = interp1d(
+    t,
+    rS_vec,
+    axis=0,
+    kind="cubic",
+    bounds_error=True
 )
 
-imin = df["Impact parameter (Rsun)"].idxmin()
+def light_time_downlink(t5):
+    """
+    Given Earth reception time t5,
+    solve for Cassini transmission time t3.
+    """
 
-print("\nClosest approach to the Sun")
-print(df.loc[imin])
+    rE = interp_E(t5)
+    rC = interp_C(t5)
 
-#print(df)
+    R = np.linalg.norm(rE - rC)
 
-df.to_csv("geometry.csv", index=False)
+    t3 = t5 - R * AU / C
 
-print()
-print("Saved geometry.csv")
+    for _ in range(20):
+
+        rC = interp_C(t3)
+
+        R = np.linalg.norm(rE - rC)
+
+        t3_new = t5 - R * AU / C
+
+        if abs(t3_new - t3) < 1e-6:
+            break
+
+        t3 = t3_new
+
+    return t3
+
+def light_time_uplink(t3):
+    """
+    Given Cassini reception/transmission time t3,
+    solve for Earth transmission time t1.
+    """
+
+    rC = interp_C(t3)
+    rE = interp_E(t3)
+
+    R = np.linalg.norm(rC - rE)
+
+    t1 = t3 - R * AU / C
+
+    for _ in range(20):
+
+        rE = interp_E(t1)
+
+        R = np.linalg.norm(rC - rE)
+
+        t1_new = t3 - R * AU / C
+
+        if abs(t1_new - t1) < 1e-6:
+            break
+
+        t1 = t1_new
+
+    return t1
+
+def closest_approach_with_bdot(t_start, t_end, r_start, r_end, dt):
+    """Return closest approach and db/dt."""
+
+    # Central value
+    _, b0, bvec0 = closest_approach(
+        t_start, t_end, r_start, r_end
+    )
+
+    # Forward trajectory
+    r_start_p = interp_E(t_start + dt)
+    r_end_p   = interp_C(t_end + dt)
+
+    _, bp, _ = closest_approach(
+        t_start + dt,
+        t_end + dt,
+        r_start_p,
+        r_end_p
+    )
+
+    # Backward trajectory
+    r_start_m = interp_E(t_start - dt)
+    r_end_m   = interp_C(t_end - dt)
+
+    _, bm, _ = closest_approach(
+        t_start - dt,
+        t_end - dt,
+        r_start_m,
+        r_end_m
+    )
+
+    b_dot = (bp - bm) / (2 * dt)
+
+    return b0, b_dot
+
+def closest_approach(t_start, t_end, r_start, r_end):
+    """
+    Given an emission time t_start and a reception time t_end,
+    we construct the straight-line trajectory and find time
+    at which the sun is found at the closest distance
+
+    Returns the time, impact parameter, and pointing vector
+    """
+
+    def distance_to_sun(tt):
+
+        alpha = (tt - t_start) / (t_end - t_start)
+
+        r_gamma = r_start + alpha * (r_end - r_start)
+
+        rS = interp_S(tt)
+
+        return np.linalg.norm(r_gamma - rS)
+
+    result = minimize_scalar(
+        distance_to_sun,
+        bounds=(t_start, t_end),
+        method="bounded",
+        options={"xatol": 1e-6}
+    )
+
+    tt = result.x
+
+    alpha = (tt - t_start) / (t_end - t_start)
+
+    r_gamma = r_start + alpha * (r_end - r_start)
+    rS = interp_S(tt)
+
+    b_vec = r_gamma - rS
+    b = np.linalg.norm(b_vec)
+
+    return tt, b, b_vec
+
+###################################
+print("\nTwo-way light-time test")
+
+for i in range(10000, len(t), 300):
+
+    t3 = t[i]
+
+    t2 = light_time_downlink(t3)
+    t1 = light_time_uplink(t2)
+
+    print(
+        f"t3 = {t3:10.1f} s   "
+        f"t2 = {t2:10.1f} s   "
+        f"t1 = {t1:10.1f} s   "
+        f"down = {t3-t2:8.2f} s   "
+        f"up = {t2-t1:8.2f} s"
+    )
+
+###################################
+print("\nDetermining t1,t3,t5 arrays")
+t1_array = []
+t3_array = []
+t5_array = []
 
 
-t_datetime = [
-    datetime.strptime(s, "A.D. %Y-%b-%d %H:%M:%S.%f")
-    for s in df["date"]
-]
+for i in range(len(t)):
+    t5 = t[i]
 
-dt = (t_datetime[1] - t_datetime[0]).total_seconds()
+    # Skipping first 3-hours
+    if t5 < 10000:
+        continue
 
-imin = df["Impact parameter (AU)"].idxmin()
-t0 = imin * dt      # dt = 60 s
-t_rel = (np.arange(len(df)) * dt - t0) / 86400.0
+    t3 = light_time_downlink(t5)
+    t1 = light_time_uplink(t3)
 
-t_sec = t_rel * 86400.0
-dt = t_sec
+    t1_array.append(t1)
+    t3_array.append(t3)
+    t5_array.append(t5)
 
-# Time derivatives (AU/s)
-drE = np.gradient(rE, dt)
-drC = np.gradient(rC, dt)
-dR  = np.gradient(R, dt)
-dlsum = np.gradient(lsum, dt)
-d2lsum = np.gradient(dlsum, dt) * 8 * 3600
+t1_array = np.array(t1_array)
+t3_array = np.array(t3_array)
+t5_array = np.array(t5_array)
 
-# Exact analytical derivative
-y_exact = K * (
-    (drE + drC + dR)/(rE + rC + R)
-    -
-    (drE + drC - dR)/(rE + rC - R)
+#######################################
+
+###################################
+print("\nDetermining t2,t4 arrays")
+t2_array = []
+t4_array = []
+
+b_up_array = []
+b_down_array = []
+
+for t1, t3, t5 in zip(t1_array, t3_array, t5_array):
+
+    rE1 = interp_E(t1)
+    rC3 = interp_C(t3)
+    rE5 = interp_E(t5)
+
+    t2, b_up, _ = closest_approach(
+        t1, t3,
+        rE1, rC3
+    )
+
+    b_up_f, db_up_f = closest_approach_with_bdot(
+        t1, t3,
+        rE1, rC3,
+        1
+    )
+
+    t4, b_down, _ = closest_approach(
+        t3, t5,
+        rC3, rE5
+    )
+
+    t2_array.append(t2)
+    t4_array.append(t4)
+
+    # AU -> solar radii
+    b_up_array.append(b_up * AU_KM / RSUN_KM)
+    b_down_array.append(b_down * AU_KM / RSUN_KM)
+
+t2_array = np.array(t2_array)
+t4_array = np.array(t4_array)
+
+b_up_array = np.array(b_up_array)
+b_down_array = np.array(b_down_array)
+
+def shapiro_uplink(t1, t2, t3):
+
+    rE1 = interp_E(t1)
+    rC3 = interp_C(t3)
+    rS2 = interp_S(t2)
+
+    # We define distances respect to the sun position at the closest approach (at t2)
+    R1 = np.linalg.norm(rE1 - rS2)
+    R3 = np.linalg.norm(rC3 - rS2)
+    R13 = np.linalg.norm(rC3 - rE1)
+
+    return m * np.log(
+        (R1 + R3 + R13) /
+        (R1 + R3 - R13)
+    )
+
+
+def shapiro_downlink(t3, t4, t5):
+
+    rC3 = interp_C(t3)
+    rE5 = interp_E(t5)
+    rS4 = interp_S(t4)
+
+    # We define distances respect to the sun position at the closest approach (at t4)
+    R3 = np.linalg.norm(rC3 - rS4)
+    R5 = np.linalg.norm(rE5 - rS4)
+    R35 = np.linalg.norm(rE5 - rC3)
+
+    return m * np.log(
+        (R3 + R5 + R35) /
+        (R3 + R5 - R35)
+    )
+
+dt_up_array = np.empty(len(t5_array))
+dt_down_array = np.empty(len(t5_array))
+
+for i, (t1, t2, t3, t4, t5) in enumerate(
+        zip(t1_array, t2_array, t3_array, t4_array, t5_array)):
+
+    dt_up_array[i] = shapiro_uplink(t1, t2, t3)
+    dt_down_array[i] = shapiro_downlink(t3, t4, t5)
+
+dt_shapiro_array = dt_up_array + dt_down_array
+
+y_shapiro = np.gradient(
+    dt_shapiro_array,
+    t5_array
 )
 
-# Numerical derivative
-y_num = np.gradient(delay, dt)
+i = np.argmax(np.abs(y_shapiro))
 
-# ------------------------------------------------------------
-# Comparison
-# ------------------------------------------------------------
+y_up_shapiro = np.gradient(
+    dt_up_array,
+    t5_array
+)
 
-plt.figure(figsize=(9,5))
+i = np.argmax(np.abs(y_shapiro))
 
-plt.plot(t_rel,1e13*y_num,label="Numerical derivative")
-plt.plot(t_rel,1e13*y_exact,"--",label="Analytical derivative")
+print("Maximum |y_shapiro|:")
+print("y =", y_shapiro[i])
+print("y_up =", y_up_shapiro[i])
+print("t1 =", t1_array[i])
+print("t2 =", t2_array[i])
+print("t3 =", t3_array[i])
+print("t4 =", t4_array[i])
+print("t5 =", t5_array[i])
 
-plt.xlabel("Days from conjunction")
-plt.ylabel(r"$10^{13}\,\Delta\nu/\nu$")
-plt.grid(True)
-plt.legend()
+# Maximum conjunction = minimum impact parameter
+i_conj = np.argmin(b_down_array)
+t_conj = t4_array[i_conj]
 
-# ------------------------------------------------------------
-# Difference
-# ------------------------------------------------------------
+# Time relative to conjunction, in days
+time_days = (np.array(t4_array) - t_conj) / 86400.0
 
-difference = y_num - y_exact
-
-print()
-print("Maximum absolute difference")
-print(np.max(np.abs(difference)))
-
-print()
-print("Relative difference")
-print(np.max(np.abs(difference))/np.max(np.abs(y_num)))
-
-# Numerical derivative
-y_num = np.gradient(delay, dt)
-
-plt.figure(figsize=(10,5))
-
-plt.title("Cassini Doppler observables (y and yJG)")
-plt.plot( t_rel, 1e13*y, "b-", lw=2, label="RG")
-plt.plot(t_rel, 1e13*yJG, "r--",  lw=2, label="JG")
-
-plt.xlabel("Days")
-plt.ylabel(r"$10^{13}\,\Delta\nu/\nu$")
-plt.grid(True)
-plt.legend()
-
-plt.figure(figsize=(10,6))
-
-plt.title("Cassini Doppler observable (Difference y-yJG)")
-plt.plot(t_rel, 1e13*(yJG - y), lw=2)
-
-plt.xlabel("Days from conjunction")
-plt.ylabel(r"$10^{13}\,\Delta(\Delta\nu/\nu)$")
-plt.grid(True)
+db_up_dt = np.gradient(b_up_array, t2_array) * RSUN_KM       # km/s
+db_down_dt = np.gradient(b_down_array, t4_array) * RSUN_KM  # km/s
 
 
-plt.figure(figsize=(10,5))
-plt.title("lE and lC)")
+# Save tab-separated file
+data = np.column_stack((time_days, y_up_shapiro, b_down_array, b_up_array, db_up_dt, db_down_dt))
 
-plt.plot(t_rel, lE, label="lE")
-plt.plot(t_rel, lC, label="lC")
+np.savetxt(
+    "params_vs_time.dat",
+    data,
+    delimiter="\t",
+    header="#time_days\ty_shapiro\tb_up\tb_down\tdb_up_dt\tdb_down_dt",
+    comments=""
+)
 
-plt.title("Line-of-sight distances")
-plt.xlabel("Days from conjunction")
-plt.ylabel("Distance (AU)")
-plt.grid(True)
-plt.legend()
-
-
-plt.figure(figsize=(10,4))
-plt.plot(t_rel, df["Impact parameter (Rsun)"])
-plt.xlabel("Days from conjunction")
-plt.ylabel("Impact parameter ($R_\\odot$)")
-plt.grid()
-
-plt.figure(figsize=(10,4))
-plt.plot(t_rel, 1e6*delay)
-plt.xlabel("Days from conjunction")
-plt.ylabel("Shapiro delay (μs)")
-plt.grid()
-
-mask = np.abs(t_rel) < 2.0
-
-plt.figure(figsize=(10,4))
-plt.plot(t_rel[mask],1e13*y[mask])
-plt.grid()
-plt.xlabel("Days from conjunction")
-plt.ylabel(r"$10^{13}\Delta\nu/\nu$")
-
-plt.figure(figsize=(10,6))
-
-#plt.plot(t_rel, dlsum, lw=2, label="D")
-plt.plot(t_rel, d2lsum, lw=2, label="D2")
-
-plt.title(r"Derivative of $l_E+l_C$")
-plt.xlabel("Days from conjunction")
-plt.ylabel(r"$d(l_E+l_C)/dt$")
-plt.grid(True)
-plt.legend()
-
-plt.show()
